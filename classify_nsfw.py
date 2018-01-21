@@ -14,7 +14,9 @@ import time
 from PIL import Image
 from StringIO import StringIO
 import caffe
+import pdb
 
+import glob
 
 def resize_image(data, sz=(256, 256)):
     """
@@ -37,7 +39,7 @@ def resize_image(data, sz=(256, 256)):
     fh_im.seek(0)
     return bytearray(fh_im.read())
 
-def caffe_preprocess_and_compute(pimg, caffe_transformer=None, caffe_net=None,
+def caffe_preprocess_and_compute(pimg_list, caffe_transformer=None, caffe_net=None,
     output_layers=None):
     """
     Run a Caffe network on an input image after preprocessing it to prepare
@@ -59,22 +61,27 @@ def caffe_preprocess_and_compute(pimg, caffe_transformer=None, caffe_net=None,
         if output_layers is None:
             output_layers = caffe_net.outputs
 
-        img_data_rs = resize_image(pimg, sz=(256, 256))
-        image = caffe.io.load_image(StringIO(img_data_rs))
+        transformed_image_list = []
+        for pimg in pimg_list:
+            img_data_rs = resize_image(pimg, sz=(256, 256))
+            image = caffe.io.load_image(StringIO(img_data_rs))
 
-        H, W, _ = image.shape
-        _, _, h, w = caffe_net.blobs['data'].data.shape
-        h_off = max((H - h) / 2, 0)
-        w_off = max((W - w) / 2, 0)
-        crop = image[h_off:h_off + h, w_off:w_off + w, :]
-        transformed_image = caffe_transformer.preprocess('data', crop)
-        transformed_image.shape = (1,) + transformed_image.shape
+            H, W, _ = image.shape
+            _, _, h, w = caffe_net.blobs['data'].data.shape
+            h_off = max((H - h) / 2, 0)
+            w_off = max((W - w) / 2, 0)
+            crop = image[h_off:h_off + h, w_off:w_off + w, :]
+            transformed_image = caffe_transformer.preprocess('data', crop)
+            transformed_image.shape = (1,) + transformed_image.shape
+            transformed_image_list.append(transformed_image)
+
+        transformed_image_list = np.vstack(transformed_image_list)
 
         input_name = caffe_net.inputs[0]
         all_outputs = caffe_net.forward_all(blobs=output_layers,
-                    **{input_name: transformed_image})
+                    **{input_name: transformed_image_list})
 
-        outputs = all_outputs[output_layers[0]][0].astype(float)
+        outputs = all_outputs[output_layers[0]].astype(float)
         return outputs
     else:
         return []
@@ -86,8 +93,8 @@ def main(argv):
     parser = argparse.ArgumentParser()
     # Required arguments: input file.
     parser.add_argument(
-        "input_file",
-        help="Path to the input image file"
+        "input_dir",
+        help="Path to the input image file directory"
     )
 
     # Optional arguments.
@@ -101,27 +108,37 @@ def main(argv):
     )
 
     args = parser.parse_args()
-    image_data = open(args.input_file).read()
+    input_files_all  = sorted(glob.glob(os.path.join(args.input_dir, "*.jpg")))
+    batch_size = 64
+
+    if os.path.exists('out.csv'):
+        os.system('rm out.csv')
 
     # Pre-load caffe model.
     nsfw_net = caffe.Net(args.model_def,  # pylint: disable=invalid-name
         args.pretrained_model, caffe.TEST)
 
-    # Load transformer
-    # Note that the parameters are hard-coded for best results
-    caffe_transformer = caffe.io.Transformer({'data': nsfw_net.blobs['data'].data.shape})
-    caffe_transformer.set_transpose('data', (2, 0, 1))  # move image channels to outermost
-    caffe_transformer.set_mean('data', np.array([104, 117, 123]))  # subtract the dataset-mean value in each channel
-    caffe_transformer.set_raw_scale('data', 255)  # rescale from [0, 1] to [0, 255]
-    caffe_transformer.set_channel_swap('data', (2, 1, 0))  # swap channels from RGB to BGR
+    for i in range(0, len(input_files_all), batch_size):
+        input_files = input_files_all[i:i+batch_size]
+        image_data = [open(input_file).read() for input_file in input_files]
 
-    # Classify.
-    scores = caffe_preprocess_and_compute(image_data, caffe_transformer=caffe_transformer, caffe_net=nsfw_net, output_layers=['prob'])
+        # Load transformer
+        # Note that the parameters are hard-coded for best results
+        caffe_transformer = caffe.io.Transformer({'data': nsfw_net.blobs['data'].data.shape})
+        caffe_transformer.set_transpose('data', (2, 0, 1))  # move image channels to outermost
+        caffe_transformer.set_mean('data', np.array([104, 117, 123]))  # subtract the dataset-mean value in each channel
+        caffe_transformer.set_raw_scale('data', 255)  # rescale from [0, 1] to [0, 255]
+        caffe_transformer.set_channel_swap('data', (2, 1, 0))  # swap channels from RGB to BGR
 
-    # Scores is the array containing SFW / NSFW image probabilities
-    # scores[1] indicates the NSFW probability
-    print "NSFW score:  " , scores[1]
+        # Classify.
+        scores = caffe_preprocess_and_compute(image_data, caffe_transformer=caffe_transformer, caffe_net=nsfw_net, output_layers=['prob'])
 
+        # Scores is the array containing SFW / NSFW image probabilities
+        # scores[1] indicates the NSFW probability
+        with open('out.csv', 'a') as file:
+            for filepath, score in zip(input_files, scores[:, 1]):
+                file.write("%s, %f\n" % (filepath, score))
+                print filepath, ", ", score
 
 
 if __name__ == '__main__':
